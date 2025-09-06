@@ -7,7 +7,9 @@ lint:
 	pre-commit run --all-files
 
 fmt:
-	black . && ruff --fix .
+	black .
+	ruff check --fix .
+	ruff format .
 
 test:
 	pytest -q
