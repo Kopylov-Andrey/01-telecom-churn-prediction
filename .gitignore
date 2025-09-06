@@ -1,0 +1,27 @@
+# OS/Editor
+.DS_Store
+.idea/
+.vscode/
+.pytest_cache/
+__pycache__/
+*.pyc
+
+# Python env
+.venv/
+.env
+.env.*
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Data/Artifacts
+data/
+!data/.gitkeep
+models/
+outputs/
+mlruns/
+.dvc/
+
+# Logs
+logs/
+*.log
