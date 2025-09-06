@@ -3,6 +3,7 @@ from pydantic import BaseModel
 
 app = FastAPI(title="Churn Prediction API", version="0.1.0")
 
+
 class CustomerFeatures(BaseModel):
     tenure: float
     monthly_charges: float
@@ -10,9 +11,11 @@ class CustomerFeatures(BaseModel):
     contract_type: str | None = None
     internet_service: str | None = None
 
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
 
 @app.post("/predict")
 def predict(features: CustomerFeatures):
