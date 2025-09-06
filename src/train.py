@@ -1,21 +1,26 @@
-# src/train.py
 from __future__ import annotations
 
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 
+import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score, average_precision_score, accuracy_score
+from sklearn.metrics import (
+    roc_auc_score,
+    average_precision_score,
+    accuracy_score,
+    roc_curve,
+)
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 import joblib
 
-# 1) Настройки путей и версия модели
+# 1) Пути и версия
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_PATH = PROJECT_ROOT / "data" / "raw" / "telco.csv"
 MODELS_DIR = PROJECT_ROOT / "models"
@@ -35,57 +40,60 @@ def load_raw_data(path: Path) -> pd.DataFrame:
 
 
 def rename_columns_to_snake_case(df: pd.DataFrame) -> pd.DataFrame:
-    # Переименуем колонки в удобный snake_case, чтобы API и обучение совпадали
+    # В этом проекте используем имена без подчеркиваний, чтобы совпадали с API
     mapping = {
-        "customerID": "customer_id",
+        "customerID": "customerid",
         "gender": "gender",
-        "SeniorCitizen": "senior_citizen",
+        "SeniorCitizen": "seniorcitizen",
         "Partner": "partner",
         "Dependents": "dependents",
         "tenure": "tenure",
-        "PhoneService": "phone_service",
-        "MultipleLines": "multiple_lines",
-        "InternetService": "internet_service",
-        "OnlineSecurity": "online_security",
-        "OnlineBackup": "online_backup",
-        "DeviceProtection": "device_protection",
-        "TechSupport": "tech_support",
-        "StreamingTV": "streaming_tv",
-        "StreamingMovies": "streaming_movies",
+        "PhoneService": "phoneservice",
+        "MultipleLines": "multiplelines",
+        "InternetService": "internetservice",
+        "OnlineSecurity": "onlinesecurity",
+        "OnlineBackup": "onlinebackup",
+        "DeviceProtection": "deviceprotection",
+        "TechSupport": "techsupport",
+        "StreamingTV": "streamingtv",
+        "StreamingMovies": "streamingmovies",
         "Contract": "contract",
-        "PaperlessBilling": "paperless_billing",
-        "PaymentMethod": "payment_method",
-        "MonthlyCharges": "monthly_charges",
-        "TotalCharges": "total_charges",
+        "PaperlessBilling": "paperlessbilling",
+        "PaymentMethod": "paymentmethod",
+        "MonthlyCharges": "monthlycharges",
+        "TotalCharges": "totalcharges",
         "Churn": "churn",
     }
     return df.rename(columns=mapping)
 
 
-def prepare_data(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+def prepare_data(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.Series, list[str], list[str]]:
     df = rename_columns_to_snake_case(df).copy()
 
-    # Приведем total_charges к числу (в датасете бывают пустые строки)
-    df["total_charges"] = pd.to_numeric(df["total_charges"], errors="coerce")
+    # В данных встречаются пустые строки в totalcharges -> приводим к числовому
+    df["totalcharges"] = pd.to_numeric(df["totalcharges"], errors="coerce")
 
-    # Целевая переменная: 1 если "Yes", иначе 0
+    # Целевая переменная: Yes -> 1, No -> 0
     y = (df["churn"] == "Yes").astype(int)
 
-    # Фичи. Выбираем компактный, но информативный набор.
-    numeric_features = ["tenure", "monthly_charges", "total_charges", "senior_citizen"]
+    # Набор признаков
+    numeric_features = ["tenure", "monthlycharges", "totalcharges", "seniorcitizen"]
     categorical_features = [
         "partner",
         "dependents",
-        "internet_service",
+        "internetservice",
         "contract",
-        "payment_method",
+        "paymentmethod",
         "gender",
-        "paperless_billing",
-        "multiple_lines",
-        "online_security",
-        "tech_support",
+        "paperlessbilling",
+        "multiplelines",
+        "onlinesecurity",
+        "techsupport",
     ]
-    # Могут быть пропуски/отсутствующие колонки — убедимся, что они существуют
+
+    # Проверка наличия всех колонок
     missing = [
         c for c in (numeric_features + categorical_features) if c not in df.columns
     ]
@@ -93,7 +101,7 @@ def prepare_data(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
         raise KeyError(f"Missing expected columns: {missing}")
 
     X = df[numeric_features + categorical_features].copy()
-    return X, y
+    return X, y, numeric_features, categorical_features
 
 
 def build_pipeline(
@@ -117,13 +125,13 @@ def build_pipeline(
             ("cat", categorical_transformer, categorical_features),
         ]
     )
-
-    model = LogisticRegression(max_iter=1000)
+    # liblinear хорошо работает с разреженными матрицами
+    model = LogisticRegression(max_iter=1000, solver="liblinear")
     pipe = Pipeline(steps=[("preprocess", preprocess), ("model", model)])
     return pipe
 
 
-def evaluate(model: Pipeline, X_val: pd.DataFrame, y_val: pd.Series) -> dict:
+def evaluate_model(model: Pipeline, X_val: pd.DataFrame, y_val: pd.Series) -> dict:
     proba = model.predict_proba(X_val)[:, 1]
     pred = (proba >= 0.5).astype(int)
     return {
@@ -133,55 +141,59 @@ def evaluate(model: Pipeline, X_val: pd.DataFrame, y_val: pd.Series) -> dict:
     }
 
 
-def save_artifacts(model: Pipeline, features: list[str]) -> None:
+def select_threshold_youden(y_true: pd.Series, proba: np.ndarray) -> float:
+    fpr, tpr, thresholds = roc_curve(y_true, proba)
+    youden_j = tpr - fpr
+    best_idx = int(np.argmax(youden_j))
+    return float(thresholds[best_idx])
+
+
+def save_artifacts(
+    model: Pipeline, features: list[str], metrics: dict, threshold: float
+) -> None:
     joblib.dump(model, MODEL_FILE)
     meta = {
         "version": MODEL_VERSION,
-        "trained_at": datetime.utcnow().isoformat() + "Z",
+        "trained_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "features": features,
         "model_file": MODEL_FILE.name,
+        "metrics": {
+            "roc_auc": float(metrics["roc_auc"]),
+            "pr_auc": float(metrics["pr_auc"]),
+            "accuracy": float(metrics["accuracy"]),
+        },
+        "threshold": float(threshold),
     }
-    META_FILE.write_text(json.dumps(meta, indent=2))
-    print(f"Saved model -> {MODEL_FILE}")
-    print(f"Saved metadata -> {META_FILE}")
+    META_FILE.write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(f"Saved model  -> {MODEL_FILE}")
+    print(f"Saved meta   -> {META_FILE}")
 
 
-def main():
-    print(f"Loading data from {DATA_PATH} ...")
+if __name__ == "__main__":
+    # Загрузка
     df = load_raw_data(DATA_PATH)
-    X, y = prepare_data(df)
 
-    numeric_features = ["tenure", "monthly_charges", "total_charges", "senior_citizen"]
-    categorical_features = [
-        "partner",
-        "dependents",
-        "internet_service",
-        "contract",
-        "payment_method",
-        "gender",
-        "paperless_billing",
-        "multiple_lines",
-        "online_security",
-        "tech_support",
-    ]
-    features = numeric_features + categorical_features
+    # Подготовка
+    X, y, numeric_features, categorical_features = prepare_data(df)
+    feature_names = numeric_features + categorical_features
 
-    print("Split train/val ...")
+    # Разбиение
     X_train, X_val, y_train, y_val = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y
     )
 
-    print("Build and fit pipeline ...")
-    pipe = build_pipeline(numeric_features, categorical_features)
-    pipe.fit(X_train, y_train)
+    # Обучение
+    model = build_pipeline(numeric_features, categorical_features)
+    model.fit(X_train, y_train)
 
-    print("Evaluate ...")
-    metrics = evaluate(pipe, X_val, y_val)
-    print("Metrics:", metrics)
+    # Метрики
+    metrics = evaluate_model(model, X_val, y_val)
 
-    print("Save artifacts ...")
-    save_artifacts(pipe, features)
+    # Порог по Youden J
+    y_val_proba = model.predict_proba(X_val)[:, 1]
+    best_threshold = select_threshold_youden(y_val, y_val_proba)
 
-
-if __name__ == "__main__":
-    main()
+    # Сохранение
+    save_artifacts(model, feature_names, metrics, best_threshold)

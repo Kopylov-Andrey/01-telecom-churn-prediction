@@ -1,80 +1,129 @@
 from __future__ import annotations
 
-from pathlib import Path
+import os
 import json
-from typing import Optional
+from typing import Any, Dict, List
 
 import joblib
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-MODEL_FILE = PROJECT_ROOT / "models" / "churn.pkl"
-META_FILE = PROJECT_ROOT / "models" / "metadata.json"
+# Пути к артефактам (можно переопределить через переменные окружения)
+DEFAULT_MODEL_PATH = "models/churn.pkl"
+DEFAULT_META_PATH = "models/metadata.json"
 
-app = FastAPI(title="Churn Prediction API", version="0.2.0")
+MODEL_PATH = os.getenv("MODEL_PATH", DEFAULT_MODEL_PATH)
+METADATA_PATH = os.getenv("METADATA_PATH", DEFAULT_META_PATH)
 
-# Грузим модель и метаданные при старте
-MODEL = None
-FEATURES = None
-if MODEL_FILE.exists() and META_FILE.exists():
+app = FastAPI(title="Churn API", version="1.0")
+
+
+class PredictRequest(BaseModel):
+    features: List[Dict[str, Any]]
+
+
+class PredictItem(BaseModel):
+    churn_proba: float
+    churn_label: int
+
+
+class PredictResponse(BaseModel):
+    predictions: List[PredictItem]
+
+
+# Загрузка модели и метаданных при старте
+pipeline = None
+metadata = {}
+FEATURES: List[str] = []
+THRESHOLD: float = 0.5
+MODEL_VERSION: str | None = None
+
+
+def _load_artifacts():
+    global pipeline, metadata, FEATURES, THRESHOLD, MODEL_VERSION
     try:
-        MODEL = joblib.load(MODEL_FILE)
-        meta = json.loads(META_FILE.read_text())
-        FEATURES = meta.get("features", [])
-        print(f"Model loaded. Features: {FEATURES}")
+        pipeline = joblib.load(MODEL_PATH)
     except Exception as e:
-        print(f"Failed to load model: {e}")
+        pipeline = None
+        print(f"[WARN] Failed to load model from {MODEL_PATH}: {e}")
+
+    try:
+        with open(METADATA_PATH, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+        FEATURES = list(metadata.get("features", []))
+        # приоритет: metadata.threshold -> env PRED_THRESHOLD -> 0.5
+        THRESHOLD = float(metadata.get("threshold", os.getenv("PRED_THRESHOLD", "0.5")))
+        MODEL_VERSION = metadata.get("version")
+    except Exception as e:
+        metadata = {}
+        FEATURES = []
+        THRESHOLD = float(os.getenv("PRED_THRESHOLD", "0.5"))
+        MODEL_VERSION = None
+        print(f"[WARN] Failed to load metadata from {METADATA_PATH}: {e}")
 
 
-class CustomerFeatures(BaseModel):
-    # Поля делаем опциональными — если чего-то нет, imputers в пайплайне справятся.
-    tenure: Optional[float] = None
-    monthly_charges: Optional[float] = None
-    total_charges: Optional[float] = None
-    senior_citizen: Optional[int] = None
-
-    partner: Optional[str] = None
-    dependents: Optional[str] = None
-    internet_service: Optional[str] = None
-    contract: Optional[str] = None
-    payment_method: Optional[str] = None
-    gender: Optional[str] = None
-    paperless_billing: Optional[str] = None
-    multiple_lines: Optional[str] = None
-    online_security: Optional[str] = None
-    tech_support: Optional[str] = None
-
-
-def to_dict(payload: CustomerFeatures) -> dict:
-    # Совместимость pydantic v1/v2
-    if hasattr(payload, "model_dump"):
-        return payload.model_dump()
-    return payload.dict()
+_load_artifacts()
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": MODEL is not None}
+    return {
+        "status": "ok",
+        "model_loaded": pipeline is not None,
+        "features_known": bool(FEATURES),
+        "threshold": THRESHOLD,
+        "model_version": MODEL_VERSION,
+    }
 
 
-@app.post("/predict")
-def predict(features: CustomerFeatures):
-    if MODEL is None or FEATURES is None:
+@app.get("/version")
+def version():
+    if not metadata:
+        raise HTTPException(status_code=500, detail="Metadata not available")
+    return metadata
+
+
+@app.post("/predict", response_model=PredictResponse)
+def predict(req: PredictRequest):
+    if pipeline is None:
+        raise HTTPException(status_code=500, detail="Model is not loaded")
+    if not FEATURES:
         raise HTTPException(
-            status_code=500, detail="Model is not loaded. Train the model first."
+            status_code=500, detail="Features are unknown (metadata missing)"
         )
+    if not req.features:
+        raise HTTPException(status_code=422, detail="Empty features list")
 
-    data = to_dict(features)
+    # Проверяем наличие всех необходимых ключей в каждом объекте
+    for i, row in enumerate(req.features):
+        missing = set(FEATURES) - set(row.keys())
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Sample #{i} missing keys: {sorted(missing)}. Expected keys: {FEATURES}",
+            )
 
-    # Готовим ровно те фичи, на которых обучались
-    row = {col: data.get(col, None) for col in FEATURES}
-    X = pd.DataFrame([row])
+    # Создаем DataFrame в правильном порядке колонок
+    df = pd.DataFrame(req.features)
+    df = df[FEATURES]  # порядок признаков из metadata
 
+    # Предсказания
     try:
-        proba = float(MODEL.predict_proba(X)[:, 1][0])
+        proba = pipeline.predict_proba(df)[:, 1]
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Inference failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
 
-    return {"churn_proba": round(proba, 6)}
+    labels = (proba >= THRESHOLD).astype(int)
+
+    preds = [
+        {"churn_proba": float(p), "churn_label": int(lbl)}
+        for p, lbl in zip(proba, labels)
+    ]
+    return {"predictions": preds}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("api:app", host="0.0.0.0", port=8001, reload=True)

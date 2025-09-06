@@ -13,10 +13,17 @@ __pycache__/
 
 # Notebooks
 .ipynb_checkpoints/
+notebooks/
 
 # Data/Artifacts
+data/raw/
+data/interim/
+data/processed/
 data/
 !data/.gitkeep
+models/*.pkl
+models/*.joblib
+models/*.bin
 models/
 outputs/
 mlruns/
